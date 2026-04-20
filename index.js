@@ -104,7 +104,7 @@ async function callGemini(payload, attempt = 0) {
 	});
 
 	if ((res.status === 429 || res.status >= 500) && attempt < 3) {
-		const delay = 400 * Math.pow(2, attempt);
+		const delay = 500 * Math.pow(2, attempt);
 		await new Promise((r) => setTimeout(r, delay));
 		return callGemini(payload, attempt + 1);
 	}
@@ -155,6 +155,14 @@ async function refreshSummary(playerId) {
 
 app.get("/health", (_req, res) => {
 	res.json({ ok: true });
+});
+
+app.get("/routes-test", (_req, res) => {
+	res.json({
+		ok: true,
+		chatGet: false,
+		chatPostShouldExist: true,
+	});
 });
 
 app.post("/v1/chat", async (req, res) => {
