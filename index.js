@@ -12,6 +12,11 @@ const PORT = process.env.PORT || 3000;
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+const PLAYER_LIMITS = {
+	dailyMessages: 50,
+	hourlyMessages: 20
+};
+
 if (!BACKEND_TOKEN) {
 	throw new Error("BACKEND_TOKEN eksik.");
 }
@@ -46,7 +51,7 @@ async function validateGeminiKey(apiKey) {
 		const txt = await res.text().catch(() => "");
 		return {
 			ok: false,
-			error: `Geçersiz key: ${res.status} ${txt.slice(0, 200)}`,
+			error: `Geçersiz key: ${res.status} ${txt.slice(0, 200)}`
 		};
 	}
 
@@ -115,10 +120,23 @@ async function tryExtractProfile(sessionId, userText) {
 	return profile;
 }
 
+async function setLanguagePreference(sessionId, languageCode) {
+	const profile = await getProfile(sessionId);
+
+	if (languageCode === "EN") {
+		profile.language_preference = "English";
+	} else {
+		profile.language_preference = "Türkçe";
+	}
+
+	await saveProfile(sessionId, profile);
+	return profile.language_preference;
+}
+
 async function getSessionMessages(sessionId, limit = 20) {
 	const result = await query(
 		`
-		SELECT role, text, created_at
+		SELECT role, text
 		FROM conversation_messages
 		WHERE session_id = $1
 		ORDER BY created_at DESC, id DESC
@@ -182,9 +200,24 @@ async function getUserUsage(sessionId) {
 		[sessionId]
 	);
 
+	const hourResult = await query(
+		`
+		SELECT
+			COUNT(*)::int AS last_hour_requests,
+			MIN(created_at) AS oldest_hour_message
+		FROM usage_events
+		WHERE session_id = $1
+		  AND event_type = 'chat'
+		  AND created_at >= NOW() - INTERVAL '1 hour'
+		`,
+		[sessionId]
+	);
+
 	const dayResult = await query(
 		`
-		SELECT COUNT(*)::int AS last_24h_requests
+		SELECT
+			COUNT(*)::int AS last_24h_requests,
+			MIN(created_at) AS oldest_day_message
 		FROM usage_events
 		WHERE session_id = $1
 		  AND event_type = 'chat'
@@ -193,11 +226,86 @@ async function getUserUsage(sessionId) {
 		[sessionId]
 	);
 
+	const total = totalResult.rows[0] || {};
+	const hour = hourResult.rows[0] || {};
+	const day = dayResult.rows[0] || {};
+
 	return {
-		totalRequests: totalResult.rows[0]?.total_requests || 0,
-		totalInputChars: totalResult.rows[0]?.total_input_chars || 0,
-		totalOutputChars: totalResult.rows[0]?.total_output_chars || 0,
-		last24hRequests: dayResult.rows[0]?.last_24h_requests || 0,
+		totalRequests: total.total_requests || 0,
+		totalInputChars: total.total_input_chars || 0,
+		totalOutputChars: total.total_output_chars || 0,
+		lastHourRequests: hour.last_hour_requests || 0,
+		last24hRequests: day.last_24h_requests || 0,
+		oldestHourMessage: hour.oldest_hour_message || null,
+		oldestDayMessage: day.oldest_day_message || null,
+	};
+}
+
+function getSecondsUntilReset(oldestDateValue, windowSeconds) {
+	if (!oldestDateValue) return 0;
+
+	const oldestMs = new Date(oldestDateValue).getTime();
+	if (Number.isNaN(oldestMs)) return 0;
+
+	const resetMs = oldestMs + (windowSeconds * 1000);
+	const diffSeconds = Math.ceil((resetMs - Date.now()) / 1000);
+
+	return Math.max(0, diffSeconds);
+}
+
+function buildUsagePayload(usage) {
+	const remainingDaily = Math.max(0, PLAYER_LIMITS.dailyMessages - (usage.last24hRequests || 0));
+	const remainingHourly = Math.max(0, PLAYER_LIMITS.hourlyMessages - (usage.lastHourRequests || 0));
+
+	const dailyBlocked = remainingDaily <= 0;
+	const hourlyBlocked = remainingHourly <= 0;
+
+	const dailyResetInSeconds = dailyBlocked
+		? getSecondsUntilReset(usage.oldestDayMessage, 24 * 60 * 60)
+		: 0;
+
+	const hourlyResetInSeconds = hourlyBlocked
+		? getSecondsUntilReset(usage.oldestHourMessage, 60 * 60)
+		: 0;
+
+	let blockedReason = null;
+	let retryAfterSeconds = 0;
+
+	if (dailyBlocked) {
+		blockedReason = "Günlük limit doldu.";
+		retryAfterSeconds = dailyResetInSeconds;
+	} else if (hourlyBlocked) {
+		blockedReason = "Saatlik limit doldu.";
+		retryAfterSeconds = hourlyResetInSeconds;
+	}
+
+	return {
+		usage: {
+			totalRequests: usage.totalRequests || 0,
+			totalInputChars: usage.totalInputChars || 0,
+			totalOutputChars: usage.totalOutputChars || 0,
+			lastHourRequests: usage.lastHourRequests || 0,
+			last24hRequests: usage.last24hRequests || 0,
+		},
+		limits: {
+			dailyMessages: PLAYER_LIMITS.dailyMessages,
+			hourlyMessages: PLAYER_LIMITS.hourlyMessages,
+		},
+		remaining: {
+			dailyMessages: remainingDaily,
+			hourlyMessages: remainingHourly,
+		},
+		blocked: {
+			daily: dailyBlocked,
+			hourly: hourlyBlocked,
+			any: dailyBlocked || hourlyBlocked,
+			reason: blockedReason,
+			retryAfterSeconds,
+		},
+		reset: {
+			dailyResetInSeconds,
+			hourlyResetInSeconds,
+		},
 	};
 }
 
@@ -361,6 +469,33 @@ app.post("/v1/set-key", async (req, res) => {
 	}
 });
 
+app.post("/v1/set-language", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		const language = String(req.body?.language || "").trim().toUpperCase();
+
+		if (language ~= "EN" && language !== "TUR") {
+			return res.status(400).json({ error: "Geçersiz dil. EN veya TUR olmalı." });
+		}
+
+		const saved = await setLanguagePreference(sessionId, language);
+
+		return res.json({
+			ok: true,
+			sessionId,
+			language,
+			savedLanguage: saved
+		});
+	} catch (err) {
+		return res.status(500).json({ error: String(err.message || err) });
+	}
+});
+
 app.post("/v1/remove-key", async (req, res) => {
 	try {
 		const token = req.headers["x-backend-token"];
@@ -391,11 +526,13 @@ app.get("/v1/key-status/:sessionId", async (req, res) => {
 
 		const sessionId = getSessionId(req.params.sessionId);
 		const result = await query(`SELECT 1 FROM user_keys WHERE session_id = $1`, [sessionId]);
+		const profile = await getProfile(sessionId);
 
 		return res.json({
 			ok: true,
 			sessionId,
 			hasKey: result.rows.length > 0,
+			languagePreference: profile.language_preference || "Türkçe"
 		});
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
@@ -415,6 +552,16 @@ app.post("/v1/chat", async (req, res) => {
 
 		if (!text) {
 			return res.status(400).json({ error: "text gerekli" });
+		}
+
+		const currentUsage = await getUserUsage(sessionId);
+		const usagePayload = buildUsagePayload(currentUsage);
+
+		if (usagePayload.blocked.any) {
+			return res.status(429).json({
+				error: usagePayload.blocked.reason || "Limit doldu.",
+				rateLimit: usagePayload,
+			});
 		}
 
 		const apiKey = await getStoredApiKey(sessionId);
@@ -439,11 +586,15 @@ app.post("/v1/chat", async (req, res) => {
 			outputText: reply,
 		});
 
+		const updatedUsage = await getUserUsage(sessionId);
+		const updatedPayload = buildUsagePayload(updatedUsage);
+
 		return res.json({
 			reply,
 			sessionId,
 			memory: true,
 			database: true,
+			rateLimit: updatedPayload,
 		});
 	} catch (err) {
 		return res.status(502).json({
@@ -481,11 +632,12 @@ app.get("/v1/usage/:sessionId", async (req, res) => {
 
 		const sessionId = getSessionId(req.params.sessionId);
 		const usage = await getUserUsage(sessionId);
+		const payload = buildUsagePayload(usage);
 
 		return res.json({
 			ok: true,
 			sessionId,
-			usage,
+			...payload,
 		});
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
