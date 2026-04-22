@@ -57,6 +57,50 @@ async function validateGeminiKey(apiKey) {
 
 	return { ok: true };
 }
+async function checkGeminiKeyHealth(apiKey) {
+	const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+	const testRes = await fetch(url, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-goog-api-key": apiKey
+		},
+		body: JSON.stringify({
+			contents: [
+				{
+					role: "user",
+					parts: [{ text: "hello" }]
+				}
+			],
+			generationConfig: {
+				temperature: 0,
+				maxOutputTokens: 5
+			}
+		})
+	});
+
+	const raw = await testRes.text();
+	let parsed = null;
+
+	try {
+		parsed = JSON.parse(raw);
+	} catch (_) {}
+
+	if (!testRes.ok) {
+		return {
+			ok: false,
+			status: testRes.status,
+			error: parsed?.error?.message || raw.slice(0, 300)
+		};
+	}
+
+	return {
+		ok: true,
+		status: 200,
+		message: "Key çalışıyor."
+	};
+}
 
 async function getProfile(sessionId) {
 	const result = await query(
@@ -435,6 +479,12 @@ app.post("/v1/set-key", async (req, res) => {
 		if (!valid.ok) {
 			return res.status(400).json({ error: valid.error });
 		}
+		const health = await checkGeminiKeyHealth(apiKey);
+if (!health.ok) {
+	return res.status(health.status || 400).json({
+		error: health.error || "Key health check başarısız."
+	});
+}
 
 		const encryptedKey = encryptText(apiKey);
 
