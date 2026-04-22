@@ -9,7 +9,6 @@ function getKey() {
 	if (!secret) {
 		throw new Error("ENCRYPTION_SECRET eksik.");
 	}
-
 	return crypto.scryptSync(secret, "aichatbot-salt-v1", KEY_LENGTH);
 }
 

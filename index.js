@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+const OWNER_NAME = "ejderg";
 const PLAYER_LIMITS = {
 	dailyMessages: 50,
 	hourlyMessages: 20
@@ -28,6 +29,11 @@ function getSessionId(raw) {
 
 function sanitizeText(text, maxLen = 1000) {
 	return String(text || "").trim().slice(0, maxLen);
+}
+
+function isOwnerRequest(req) {
+	const ownerName = String(req.headers["x-owner-name"] || "").trim().toLowerCase();
+	return ownerName === OWNER_NAME.toLowerCase();
 }
 
 async function getStoredApiKey(sessionId) {
@@ -57,6 +63,7 @@ async function validateGeminiKey(apiKey) {
 
 	return { ok: true };
 }
+
 async function checkGeminiKeyHealth(apiKey) {
 	const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
@@ -191,7 +198,7 @@ async function getSessionMessages(sessionId, limit = 20) {
 
 	return result.rows.reverse().map((row) => ({
 		role: row.role,
-		parts: [{ text: row.text }],
+		parts: [{ text: row.text }]
 	}));
 }
 
@@ -226,7 +233,7 @@ async function logUsage({ sessionId, playerName, eventType, inputText = "", outp
 			sanitizeText(inputText, 1000),
 			sanitizeText(outputText, 1000),
 			String(inputText || "").length,
-			String(outputText || "").length,
+			String(outputText || "").length
 		]
 	);
 }
@@ -281,7 +288,7 @@ async function getUserUsage(sessionId) {
 		lastHourRequests: hour.last_hour_requests || 0,
 		last24hRequests: day.last_24h_requests || 0,
 		oldestHourMessage: hour.oldest_hour_message || null,
-		oldestDayMessage: day.oldest_day_message || null,
+		oldestDayMessage: day.oldest_day_message || null
 	};
 }
 
@@ -329,28 +336,105 @@ function buildUsagePayload(usage) {
 			totalInputChars: usage.totalInputChars || 0,
 			totalOutputChars: usage.totalOutputChars || 0,
 			lastHourRequests: usage.lastHourRequests || 0,
-			last24hRequests: usage.last24hRequests || 0,
+			last24hRequests: usage.last24hRequests || 0
 		},
 		limits: {
 			dailyMessages: PLAYER_LIMITS.dailyMessages,
-			hourlyMessages: PLAYER_LIMITS.hourlyMessages,
+			hourlyMessages: PLAYER_LIMITS.hourlyMessages
 		},
 		remaining: {
 			dailyMessages: remainingDaily,
-			hourlyMessages: remainingHourly,
+			hourlyMessages: remainingHourly
 		},
 		blocked: {
 			daily: dailyBlocked,
 			hourly: hourlyBlocked,
 			any: dailyBlocked || hourlyBlocked,
 			reason: blockedReason,
-			retryAfterSeconds,
+			retryAfterSeconds
 		},
 		reset: {
 			dailyResetInSeconds,
-			hourlyResetInSeconds,
-		},
+			hourlyResetInSeconds
+		}
 	};
+}
+
+async function addFlag(sessionId, playerName, reason) {
+	const existing = await query(
+		`SELECT session_id, flag_count FROM moderation_flags WHERE session_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+		[sessionId]
+	);
+
+	if (existing.rows.length > 0) {
+		await query(
+			`
+			UPDATE moderation_flags
+			SET flag_count = flag_count + 1,
+				player_name = $2,
+				reason = $3,
+				updated_at = NOW()
+			WHERE session_id = $1
+			`,
+			[sessionId, playerName || "", reason]
+		);
+	} else {
+		await query(
+			`
+			INSERT INTO moderation_flags (session_id, player_name, reason, flag_count)
+			VALUES ($1, $2, $3, 1)
+			`,
+			[sessionId, playerName || "", reason]
+		);
+	}
+}
+
+async function getFlagSummary() {
+	const result = await query(`
+		SELECT session_id, player_name, reason, flag_count, updated_at
+		FROM moderation_flags
+		ORDER BY flag_count DESC, updated_at DESC
+		LIMIT 50
+	`);
+	return result.rows;
+}
+
+async function banPlayerRecord(sessionId, playerName, reason) {
+	await query(
+		`
+		INSERT INTO banned_players (session_id, player_name, reason, banned_at, unbanned_at)
+		VALUES ($1, $2, $3, NOW(), NULL)
+		ON CONFLICT (session_id)
+		DO UPDATE SET
+			player_name = EXCLUDED.player_name,
+			reason = EXCLUDED.reason,
+			banned_at = NOW(),
+			unbanned_at = NULL
+		`,
+		[sessionId, playerName || "", reason || ""]
+	);
+}
+
+async function unbanPlayerRecord(sessionId) {
+	await query(
+		`
+		UPDATE banned_players
+		SET unbanned_at = NOW()
+		WHERE session_id = $1
+		`,
+		[sessionId]
+	);
+}
+
+async function getBannedPlayers() {
+	const result = await query(`
+		SELECT session_id, player_name, reason, banned_at
+		FROM banned_players
+		WHERE unbanned_at IS NULL
+		ORDER BY banned_at DESC
+		LIMIT 100
+	`);
+	return result.rows;
 }
 
 async function getTopUsers(limit = 20) {
@@ -419,12 +503,18 @@ async function callGemini(apiKey, sessionId, userText) {
 		body: JSON.stringify(payload)
 	});
 
+	const raw = await res.text();
+	let json = null;
+
+	try {
+		json = JSON.parse(raw);
+	} catch (_) {}
+
 	if (!res.ok) {
-		const txt = await res.text().catch(() => "");
-		throw new Error(`Gemini hata: ${res.status} ${txt.slice(0, 300)}`);
+		const msg = json?.error?.message || raw.slice(0, 300);
+		throw new Error(`Gemini hata: ${res.status} ${msg}`);
 	}
 
-	const json = await res.json();
 	const parts = json?.candidates?.[0]?.content?.parts || [];
 	const replyPart = parts.find((p) => typeof p.text === "string" && p.text.trim() !== "");
 
@@ -446,12 +536,40 @@ app.get("/health", async (_req, res) => {
 			databaseMemory: true,
 			usageTracking: true,
 			usersWithKeys: userCount.rows[0]?.count || 0,
-			totalMessages: messageCount.rows[0]?.count || 0,
+			totalMessages: messageCount.rows[0]?.count || 0
 		});
 	} catch (err) {
 		res.status(500).json({
 			ok: false,
-			error: String(err.message || err),
+			error: String(err.message || err)
+		});
+	}
+});
+
+app.post("/v1/check-key", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const apiKey = String(req.body?.apiKey || "").trim();
+
+		if (!apiKey) {
+			return res.status(400).json({ error: "apiKey gerekli" });
+		}
+
+		const health = await checkGeminiKeyHealth(apiKey);
+
+		if (!health.ok) {
+			return res.status(health.status || 400).json(health);
+		}
+
+		return res.json(health);
+	} catch (err) {
+		return res.status(500).json({
+			ok: false,
+			error: String(err.message || err)
 		});
 	}
 });
@@ -479,12 +597,13 @@ app.post("/v1/set-key", async (req, res) => {
 		if (!valid.ok) {
 			return res.status(400).json({ error: valid.error });
 		}
+
 		const health = await checkGeminiKeyHealth(apiKey);
-if (!health.ok) {
-	return res.status(health.status || 400).json({
-		error: health.error || "Key health check başarısız."
-	});
-}
+		if (!health.ok) {
+			return res.status(health.status || 400).json({
+				error: health.error || "Key health check başarısız."
+			});
+		}
 
 		const encryptedKey = encryptText(apiKey);
 
@@ -504,17 +623,17 @@ if (!health.ok) {
 		await logUsage({
 			sessionId,
 			playerName,
-			eventType: "set_key",
+			eventType: "set_key"
 		});
 
 		return res.json({
 			ok: true,
 			sessionId,
-			message: "API key başarıyla bağlandı.",
+			message: "API key başarıyla bağlandı."
 		});
 	} catch (err) {
 		return res.status(500).json({
-			error: String(err.message || err),
+			error: String(err.message || err)
 		});
 	}
 });
@@ -560,7 +679,7 @@ app.post("/v1/remove-key", async (req, res) => {
 		return res.json({
 			ok: true,
 			sessionId,
-			message: "API key kaldırıldı.",
+			message: "API key kaldırıldı."
 		});
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
@@ -610,7 +729,7 @@ app.post("/v1/chat", async (req, res) => {
 		if (usagePayload.blocked.any) {
 			return res.status(429).json({
 				error: usagePayload.blocked.reason || "Limit doldu.",
-				rateLimit: usagePayload,
+				rateLimit: usagePayload
 			});
 		}
 
@@ -633,7 +752,7 @@ app.post("/v1/chat", async (req, res) => {
 			playerName,
 			eventType: "chat",
 			inputText: text,
-			outputText: reply,
+			outputText: reply
 		});
 
 		const updatedUsage = await getUserUsage(sessionId);
@@ -644,11 +763,11 @@ app.post("/v1/chat", async (req, res) => {
 			sessionId,
 			memory: true,
 			database: true,
-			rateLimit: updatedPayload,
+			rateLimit: updatedPayload
 		});
 	} catch (err) {
 		return res.status(502).json({
-			error: String(err.message || err),
+			error: String(err.message || err)
 		});
 	}
 });
@@ -666,7 +785,7 @@ app.post("/v1/reset-memory", async (req, res) => {
 		return res.json({
 			ok: true,
 			sessionId,
-			reset: true,
+			reset: true
 		});
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
@@ -687,7 +806,7 @@ app.get("/v1/usage/:sessionId", async (req, res) => {
 		return res.json({
 			ok: true,
 			sessionId,
-			...payload,
+			...payload
 		});
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
@@ -700,13 +819,100 @@ app.get("/v1/admin/usage-top", async (req, res) => {
 		if (token !== BACKEND_TOKEN) {
 			return res.status(401).json({ error: "unauthorized" });
 		}
+		if (!isOwnerRequest(req)) {
+			return res.status(403).json({ error: "forbidden" });
+		}
 
 		const users = await getTopUsers(20);
 
 		return res.json({
 			ok: true,
-			users,
+			users
 		});
+	} catch (err) {
+		return res.status(500).json({ error: String(err.message || err) });
+	}
+});
+
+app.get("/v1/admin/bans", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+		if (!isOwnerRequest(req)) {
+			return res.status(403).json({ error: "forbidden" });
+		}
+
+		const bans = await getBannedPlayers();
+		const flags = await getFlagSummary();
+
+		return res.json({
+			ok: true,
+			bans,
+			flags
+		});
+	} catch (err) {
+		return res.status(500).json({ error: String(err.message || err) });
+	}
+});
+
+app.post("/v1/admin/unban", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+		if (!isOwnerRequest(req)) {
+			return res.status(403).json({ error: "forbidden" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		await unbanPlayerRecord(sessionId);
+
+		return res.json({
+			ok: true,
+			sessionId,
+			message: "Unbanned"
+		});
+	} catch (err) {
+		return res.status(500).json({ error: String(err.message || err) });
+	}
+});
+
+app.post("/v1/admin/flag", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		const playerName = sanitizeText(req.body?.playerName, 80);
+		const reason = sanitizeText(req.body?.reason, 200);
+
+		await addFlag(sessionId, playerName, reason);
+
+		return res.json({ ok: true });
+	} catch (err) {
+		return res.status(500).json({ error: String(err.message || err) });
+	}
+});
+
+app.post("/v1/admin/ban-record", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		const playerName = sanitizeText(req.body?.playerName, 80);
+		const reason = sanitizeText(req.body?.reason, 200);
+
+		await banPlayerRecord(sessionId, playerName, reason);
+
+		return res.json({ ok: true });
 	} catch (err) {
 		return res.status(500).json({ error: String(err.message || err) });
 	}

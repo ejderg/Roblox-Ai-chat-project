@@ -52,6 +52,33 @@ async function initSchema() {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 	`);
+
+	await query(`
+		CREATE TABLE IF NOT EXISTS moderation_flags (
+			id BIGSERIAL PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			player_name TEXT,
+			reason TEXT NOT NULL,
+			flag_count INTEGER NOT NULL DEFAULT 1,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+	`);
+
+	await query(`
+		CREATE INDEX IF NOT EXISTS idx_moderation_flags_session
+		ON moderation_flags(session_id, updated_at DESC);
+	`);
+
+	await query(`
+		CREATE TABLE IF NOT EXISTS banned_players (
+			session_id TEXT PRIMARY KEY,
+			player_name TEXT,
+			reason TEXT,
+			banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			unbanned_at TIMESTAMPTZ
+		);
+	`);
 }
 
 module.exports = {

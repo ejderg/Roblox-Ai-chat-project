@@ -1,6 +1,6 @@
 {
   "name": "roblox-ai-chat-project",
-  "version": "1.0.7-SAFE",
+  "version": "1.0.7-upd",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
