@@ -1,13 +1,13 @@
 {
-  "name": "ai-backend",
-  "version": "1.0.0",
+  "name": "roblox-ai-chat-project",
+  "version": "1.0.7-SAFE",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "pg": "^8.16.3"
   }
 }
