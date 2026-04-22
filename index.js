@@ -5,46 +5,42 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(express.json({ limit: "256kb" }));
+app.use(express.json({ limit: "512kb" }));
 
 const PORT = process.env.PORT || 3000;
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-if (!BACKEND_TOKEN || !GEMINI_API_KEY) {
-	throw new Error("BACKEND_TOKEN veya GEMINI_API_KEY eksik.");
+if (!BACKEND_TOKEN) {
+	throw new Error("BACKEND_TOKEN eksik.");
 }
 
 const MEMORY_FILE = path.join(__dirname, "memory.json");
+const KEYS_FILE = path.join(__dirname, "user_keys.json");
+
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_MESSAGE_LENGTH = 1000;
 
-let memoryStore = loadMemory();
+let memoryStore = loadJson(MEMORY_FILE, {});
+let keyStore = loadJson(KEYS_FILE, {});
 
-function loadMemory() {
+function loadJson(filePath, fallback) {
 	try {
-		if (!fs.existsSync(MEMORY_FILE)) {
-			return {};
-		}
-
-		const raw = fs.readFileSync(MEMORY_FILE, "utf8");
-		if (!raw.trim()) {
-			return {};
-		}
-
+		if (!fs.existsSync(filePath)) return fallback;
+		const raw = fs.readFileSync(filePath, "utf8");
+		if (!raw.trim()) return fallback;
 		return JSON.parse(raw);
 	} catch (err) {
-		console.error("memory.json okunamadı:", err);
-		return {};
+		console.error("JSON okunamadı:", filePath, err);
+		return fallback;
 	}
 }
 
-function saveMemory() {
+function saveJson(filePath, data) {
 	try {
-		fs.writeFileSync(MEMORY_FILE, JSON.stringify(memoryStore, null, 2), "utf8");
+		fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
 	} catch (err) {
-		console.error("memory.json yazılamadı:", err);
+		console.error("JSON yazılamadı:", filePath, err);
 	}
 }
 
@@ -65,12 +61,7 @@ function ensureSession(sessionId) {
 			updatedAt: new Date().toISOString()
 		};
 	}
-
 	return memoryStore[sessionId];
-}
-
-function getHistory(sessionId) {
-	return ensureSession(sessionId).history;
 }
 
 function pushHistory(sessionId, role, text) {
@@ -86,16 +77,12 @@ function pushHistory(sessionId, role, text) {
 	}
 
 	session.updatedAt = new Date().toISOString();
-	saveMemory();
+	saveJson(MEMORY_FILE, memoryStore);
 }
 
 function buildProfileText(profile) {
 	const entries = Object.entries(profile || {}).filter(([, v]) => String(v || "").trim() !== "");
-
-	if (entries.length === 0) {
-		return "";
-	}
-
+	if (entries.length === 0) return "";
 	const lines = entries.map(([key, value]) => `- ${key}: ${value}`);
 	return `Kullanıcı hakkında bilinen kalıcı bilgiler:\n${lines.join("\n")}`;
 }
@@ -113,33 +100,53 @@ function tryExtractProfile(sessionId, userText) {
 		{
 			key: "favorite_color",
 			regex: /(?:en sevdiğim renk|favorite color is)\s+([a-zA-ZçÇğĞıİöÖşŞüÜ -]{2,30})/i
-		},
-		{
-			key: "language_preference",
-			regex: /(?:türkçe konuş|ingilizce konuş|speak english|speak turkish)/i
 		}
 	];
 
 	for (const item of patterns) {
 		const match = text.match(item.regex);
-		if (!match) continue;
-
-		if (item.key === "language_preference") {
-			if (lower.includes("ingilizce") || lower.includes("english")) {
-				session.profile.language_preference = "English";
-			} else if (lower.includes("türkçe") || lower.includes("turkish")) {
-				session.profile.language_preference = "Türkçe";
-			}
-		} else {
+		if (match) {
 			session.profile[item.key] = sanitizeText(match[1], 80);
 		}
 	}
 
+	if (lower.includes("türkçe konuş") || lower.includes("speak turkish")) {
+		session.profile.language_preference = "Türkçe";
+	}
+
+	if (lower.includes("ingilizce konuş") || lower.includes("speak english")) {
+		session.profile.language_preference = "English";
+	}
+
 	session.updatedAt = new Date().toISOString();
-	saveMemory();
+	saveJson(MEMORY_FILE, memoryStore);
 }
 
-async function callGemini(sessionId, userText) {
+function getUserKey(sessionId) {
+	const row = keyStore[sessionId];
+	if (!row) return "";
+	return String(row.apiKey || "").trim();
+}
+
+async function validateGeminiKey(apiKey) {
+	const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+
+	const res = await fetch(url, {
+		method: "GET"
+	});
+
+	if (!res.ok) {
+		const txt = await res.text().catch(() => "");
+		return {
+			ok: false,
+			error: `Geçersiz key: ${res.status} ${txt.slice(0, 200)}`
+		};
+	}
+
+	return { ok: true };
+}
+
+async function callGemini(apiKey, sessionId, userText) {
 	const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 	const session = ensureSession(sessionId);
@@ -178,7 +185,7 @@ async function callGemini(sessionId, userText) {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			"x-goog-api-key": GEMINI_API_KEY
+			"x-goog-api-key": apiKey
 		},
 		body: JSON.stringify(payload)
 	});
@@ -202,90 +209,137 @@ async function callGemini(sessionId, userText) {
 app.get("/health", (_req, res) => {
 	res.json({
 		ok: true,
-		persistentMemory: true,
-		sessionCount: Object.keys(memoryStore).length
+		byok: true,
+		sessionCount: Object.keys(memoryStore).length,
+		keyCount: Object.keys(keyStore).length
 	});
+});
+
+app.post("/v1/set-key", async (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		const apiKey = String(req.body?.apiKey || "").trim();
+		const playerName = String(req.body?.playerName || "").trim();
+
+		if (!apiKey) {
+			return res.status(400).json({ error: "apiKey gerekli" });
+		}
+
+		if (!apiKey.startsWith("AIza")) {
+			return res.status(400).json({ error: "Bu Gemini key gibi görünmüyor." });
+		}
+
+		const valid = await validateGeminiKey(apiKey);
+		if (!valid.ok) {
+			return res.status(400).json({ error: valid.error });
+		}
+
+		keyStore[sessionId] = {
+			apiKey,
+			playerName,
+			updatedAt: new Date().toISOString()
+		};
+		saveJson(KEYS_FILE, keyStore);
+
+		return res.json({
+			ok: true,
+			sessionId,
+			message: "API key başarıyla bağlandı."
+		});
+	} catch (err) {
+		return res.status(500).json({
+			error: String(err.message || err)
+		});
+	}
+});
+
+app.post("/v1/remove-key", (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.body?.sessionId);
+		delete keyStore[sessionId];
+		saveJson(KEYS_FILE, keyStore);
+
+		return res.json({
+			ok: true,
+			sessionId,
+			message: "API key kaldırıldı."
+		});
+	} catch (err) {
+		return res.status(500).json({
+			error: String(err.message || err)
+		});
+	}
+});
+
+app.get("/v1/key-status/:sessionId", (req, res) => {
+	try {
+		const token = req.headers["x-backend-token"];
+		if (token !== BACKEND_TOKEN) {
+			return res.status(401).json({ error: "unauthorized" });
+		}
+
+		const sessionId = getSessionId(req.params.sessionId);
+		const hasKey = !!getUserKey(sessionId);
+
+		return res.json({
+			ok: true,
+			sessionId,
+			hasKey
+		});
+	} catch (err) {
+		return res.status(500).json({
+			error: String(err.message || err)
+		});
+	}
 });
 
 app.post("/v1/chat", async (req, res) => {
 	try {
 		const token = req.headers["x-backend-token"];
-
 		if (token !== BACKEND_TOKEN) {
 			return res.status(401).json({ error: "unauthorized" });
 		}
 
-		const text = sanitizeText(req.body?.text, 400);
 		const sessionId = getSessionId(req.body?.sessionId);
+		const text = sanitizeText(req.body?.text, 400);
 
 		if (!text) {
 			return res.status(400).json({ error: "text gerekli" });
 		}
 
+		const apiKey = getUserKey(sessionId);
+		if (!apiKey) {
+			return res.status(400).json({
+				error: "Önce kendi Gemini API key'ini bağlaman lazım."
+			});
+		}
+
 		tryExtractProfile(sessionId, text);
 
-		const reply = await callGemini(sessionId, text);
+		const reply = await callGemini(apiKey, sessionId, text);
 
 		pushHistory(sessionId, "user", text);
 		pushHistory(sessionId, "model", reply);
 
 		return res.json({
 			reply,
+			sessionId,
 			memory: true,
-			persistent: true,
-			sessionId
+			byok: true
 		});
 	} catch (err) {
 		console.log("CRASH:", err);
 		return res.status(502).json({
-			error: String(err.message || err)
-		});
-	}
-});
-
-app.post("/v1/reset-memory", (req, res) => {
-	try {
-		const token = req.headers["x-backend-token"];
-
-		if (token !== BACKEND_TOKEN) {
-			return res.status(401).json({ error: "unauthorized" });
-		}
-
-		const sessionId = getSessionId(req.body?.sessionId);
-
-		delete memoryStore[sessionId];
-		saveMemory();
-
-		return res.json({
-			ok: true,
-			reset: true,
-			sessionId
-		});
-	} catch (err) {
-		return res.status(500).json({
-			error: String(err.message || err)
-		});
-	}
-});
-
-app.get("/v1/memory/:sessionId", (req, res) => {
-	try {
-		const token = req.headers["x-backend-token"];
-
-		if (token !== BACKEND_TOKEN) {
-			return res.status(401).json({ error: "unauthorized" });
-		}
-
-		const sessionId = getSessionId(req.params.sessionId);
-		const session = ensureSession(sessionId);
-
-		return res.json({
-			ok: true,
-			sessionId,
-			memory: session
-		});
-	} catch (err) {
-		return res.status(500).json({
 			error: String(err.message || err)
 		});
 	}

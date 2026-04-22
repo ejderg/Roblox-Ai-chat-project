@@ -2,4 +2,5 @@ node_modules
 .env
 .env.*
 memory.json
+user_keys.json
 npm-debug.log*
