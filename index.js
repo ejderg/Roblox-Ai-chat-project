@@ -479,7 +479,7 @@ app.post("/v1/set-language", async (req, res) => {
 		const sessionId = getSessionId(req.body?.sessionId);
 		const language = String(req.body?.language || "").trim().toUpperCase();
 
-		if (language ~= "EN" && language !== "TUR") {
+		if (language !== "EN" && language !== "TUR") {
 			return res.status(400).json({ error: "Geçersiz dil. EN veya TUR olmalı." });
 		}
 
