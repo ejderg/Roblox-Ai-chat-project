@@ -525,6 +525,26 @@ async function callGemini(apiKey, sessionId, userText) {
 	return replyPart.text.trim();
 }
 
+async function callGeminiWithRetry(apiKey, sessionId, userText, retries = 2) {
+	try {
+		return await callGemini(apiKey, sessionId, userText);
+	} catch (err) {
+		const msg = String(err.message || err).toLowerCase();
+
+		const shouldRetry =
+			msg.includes("high demand") ||
+			msg.includes("currently experiencing high demand") ||
+			msg.includes("temporarily unavailable");
+
+		if (shouldRetry && retries > 0) {
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			return callGeminiWithRetry(apiKey, sessionId, userText, retries - 1);
+		}
+
+		throw err;
+	}
+}
+
 app.get("/health", async (_req, res) => {
 	try {
 		const userCount = await query(`SELECT COUNT(*)::int AS count FROM user_keys`);
@@ -742,7 +762,7 @@ app.post("/v1/chat", async (req, res) => {
 
 		await tryExtractProfile(sessionId, text);
 
-		const reply = await callGemini(apiKey, sessionId, text);
+		const reply = await callGeminiWithRetry(apiKey, sessionId, text, 2);
 
 		await addMessage(sessionId, "user", text);
 		await addMessage(sessionId, "model", reply);
