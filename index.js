@@ -609,8 +609,10 @@ app.post("/v1/set-key", async (req, res) => {
 			return res.status(400).json({ error: "apiKey gerekli" });
 		}
 
-		if (!apiKey.startsWith("AIza")) {
-			return res.status(400).json({ error: "Bu Gemini key gibi görünmüyor." });
+		// Prefix kontrolü kaldırıldı: Gemini API key her zaman "AIza" ile başlamak zorunda değil.
+		// Gerçek doğrulama aşağıdaki Google/Gemini API çağrılarıyla yapılıyor.
+		if (apiKey.length < 16 || apiKey.length > 512 || /\s/.test(apiKey)) {
+			return res.status(400).json({ error: "API key formatı geçersiz." });
 		}
 
 		const valid = await validateGeminiKey(apiKey);
