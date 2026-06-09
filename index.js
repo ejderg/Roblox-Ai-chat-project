@@ -10,7 +10,17 @@ app.use(express.json({ limit: "512kb" }));
 
 const PORT = process.env.PORT || 3000;
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+const DEFAULT_MODELS = {
+	gemini: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+	openai: process.env.OPENAI_MODEL || "gpt-4o-mini",
+	openrouter: process.env.OPENROUTER_MODEL || "openrouter/free"
+};
+
+const OPENAI_CHAT_URL = process.env.OPENAI_CHAT_URL || "https://api.openai.com/v1/chat/completions";
+const OPENROUTER_CHAT_URL = process.env.OPENROUTER_CHAT_URL || "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://roblox.com";
+const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "XaraAI Roblox Chat";
 
 const OWNER_NAME = "ejderg";
 const PLAYER_LIMITS = {
@@ -36,36 +46,81 @@ function isOwnerRequest(req) {
 	return ownerName === OWNER_NAME.toLowerCase();
 }
 
-async function getStoredApiKey(sessionId) {
+function normalizeProvider(raw) {
+	const value = String(raw || "gemini").trim().toLowerCase();
+
+	if (["gemini", "google", "google-gemini"].includes(value)) return "gemini";
+	if (["openai", "gpt", "chatgpt"].includes(value)) return "openai";
+	if (["openrouter", "free", "free-model", "free_model"].includes(value)) return "openrouter";
+
+	return "";
+}
+
+function getProviderLabel(provider) {
+	const map = {
+		gemini: "Gemini",
+		openai: "GPT/OpenAI",
+		openrouter: "Free/OpenRouter"
+	};
+
+	return map[provider] || "AI";
+}
+
+function getDefaultModel(provider) {
+	return DEFAULT_MODELS[provider] || DEFAULT_MODELS.gemini;
+}
+
+function normalizeAiConfig(raw = {}) {
+	const provider = normalizeProvider(raw.provider);
+	const apiKey = String(raw.apiKey || raw.key || "").trim();
+	const model = String(raw.model || getDefaultModel(provider)).trim() || getDefaultModel(provider);
+
+	return { provider, apiKey, model };
+}
+
+function validateApiKeyFormat(apiKey) {
+	const key = String(apiKey || "").trim();
+
+	if (!key) {
+		return { ok: false, error: "apiKey gerekli" };
+	}
+
+	if (key.length < 16 || key.length > 512 || /\s/.test(key)) {
+		return { ok: false, error: "API key formatı geçersiz." };
+	}
+
+	return { ok: true };
+}
+
+async function getStoredAiConfig(sessionId) {
 	const result = await query(
 		`SELECT encrypted_key FROM user_keys WHERE session_id = $1`,
 		[sessionId]
 	);
 
 	if (result.rows.length === 0) {
-		return "";
+		return null;
 	}
 
-	return decryptText(result.rows[0].encrypted_key);
+	const decrypted = decryptText(result.rows[0].encrypted_key);
+
+	try {
+		const parsed = JSON.parse(decrypted);
+		if (parsed && typeof parsed === "object" && parsed.apiKey) {
+			return normalizeAiConfig(parsed);
+		}
+	} catch (_) {}
+
+	// Eski kayıt uyumluluğu: Daha önce sadece düz Gemini key saklanıyordu.
+	return normalizeAiConfig({
+		provider: "gemini",
+		apiKey: decrypted,
+		model: DEFAULT_MODELS.gemini
+	});
 }
 
-async function validateGeminiKey(apiKey) {
-	const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-	const res = await fetch(url);
-
-	if (!res.ok) {
-		const txt = await res.text().catch(() => "");
-		return {
-			ok: false,
-			error: `Geçersiz key: ${res.status} ${txt.slice(0, 200)}`
-		};
-	}
-
-	return { ok: true };
-}
-
-async function checkGeminiKeyHealth(apiKey) {
-	const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+async function checkGeminiKeyHealth(apiKey, model = DEFAULT_MODELS.gemini) {
+	const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
 	const testRes = await fetch(url, {
 		method: "POST",
@@ -105,8 +160,67 @@ async function checkGeminiKeyHealth(apiKey) {
 	return {
 		ok: true,
 		status: 200,
-		message: "Key çalışıyor."
+		message: "Gemini key çalışıyor."
 	};
+}
+
+async function checkOpenAiCompatibleKeyHealth(config) {
+	const provider = config.provider;
+	const url = provider === "openrouter" ? OPENROUTER_CHAT_URL : OPENAI_CHAT_URL;
+
+	const headers = {
+		"Content-Type": "application/json",
+		"Authorization": `Bearer ${config.apiKey}`
+	};
+
+	if (provider === "openrouter") {
+		headers["HTTP-Referer"] = OPENROUTER_REFERER;
+		headers["X-Title"] = OPENROUTER_TITLE;
+	}
+
+	const testRes = await fetch(url, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			model: config.model,
+			messages: [{ role: "user", content: "hello" }],
+			temperature: 0,
+			max_tokens: 5
+		})
+	});
+
+	const raw = await testRes.text();
+	let parsed = null;
+
+	try {
+		parsed = JSON.parse(raw);
+	} catch (_) {}
+
+	if (!testRes.ok) {
+		return {
+			ok: false,
+			status: testRes.status,
+			error: parsed?.error?.message || raw.slice(0, 300)
+		};
+	}
+
+	return {
+		ok: true,
+		status: 200,
+		message: `${getProviderLabel(provider)} key çalışıyor.`
+	};
+}
+
+async function checkAiKeyHealth(config) {
+	if (!config.provider) {
+		return { ok: false, status: 400, error: "Geçersiz provider." };
+	}
+
+	if (config.provider === "gemini") {
+		return checkGeminiKeyHealth(config.apiKey, config.model);
+	}
+
+	return checkOpenAiCompatibleKeyHealth(config);
 }
 
 async function getProfile(sessionId) {
@@ -458,13 +572,8 @@ async function getTopUsers(limit = 20) {
 	return result.rows;
 }
 
-async function callGemini(apiKey, sessionId, userText) {
-	const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
-	const history = await getSessionMessages(sessionId, 20);
-	const profile = await getProfile(sessionId);
+function buildSystemPrompt(profile) {
 	const profileText = buildProfileText(profile);
-
 	const systemText = [
 		"Sen Roblox içinde çalışan yardımsever bir AI asistansın.",
 		"Kullanıcı hangi dilde yazarsa o dilde cevap ver.",
@@ -473,13 +582,19 @@ async function callGemini(apiKey, sessionId, userText) {
 		"Kullanıcıyla ilgili kayıtlı bilgileri uygun olduğunda kullan."
 	].join(" ");
 
+	return profileText ? `${systemText}\n\n${profileText}` : systemText;
+}
+
+async function callGemini(config, sessionId, userText) {
+	const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`;
+
+	const history = await getSessionMessages(sessionId, 20);
+	const profile = await getProfile(sessionId);
+	const systemText = buildSystemPrompt(profile);
+
 	const payload = {
 		systemInstruction: {
-			parts: [
-				{
-					text: profileText ? `${systemText}\n\n${profileText}` : systemText
-				}
-			]
+			parts: [{ text: systemText }]
 		},
 		contents: [
 			...history,
@@ -498,7 +613,7 @@ async function callGemini(apiKey, sessionId, userText) {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey
+			"x-goog-api-key": config.apiKey
 		},
 		body: JSON.stringify(payload)
 	});
@@ -525,20 +640,93 @@ async function callGemini(apiKey, sessionId, userText) {
 	return replyPart.text.trim();
 }
 
-async function callGeminiWithRetry(apiKey, sessionId, userText, retries = 2) {
+function historyToOpenAiMessages(history) {
+	return history.map((row) => ({
+		role: row.role === "model" ? "assistant" : "user",
+		content: String(row.parts?.[0]?.text || "")
+	})).filter((row) => row.content.trim() !== "");
+}
+
+async function callOpenAiCompatible(config, sessionId, userText) {
+	const url = config.provider === "openrouter" ? OPENROUTER_CHAT_URL : OPENAI_CHAT_URL;
+	const history = await getSessionMessages(sessionId, 20);
+	const profile = await getProfile(sessionId);
+	const systemText = buildSystemPrompt(profile);
+
+	const headers = {
+		"Content-Type": "application/json",
+		"Authorization": `Bearer ${config.apiKey}`
+	};
+
+	if (config.provider === "openrouter") {
+		headers["HTTP-Referer"] = OPENROUTER_REFERER;
+		headers["X-Title"] = OPENROUTER_TITLE;
+	}
+
+	const payload = {
+		model: config.model,
+		messages: [
+			{ role: "system", content: systemText },
+			...historyToOpenAiMessages(history),
+			{ role: "user", content: sanitizeText(userText, 400) }
+		],
+		temperature: 0.7,
+		max_tokens: 180
+	};
+
+	const res = await fetch(url, {
+		method: "POST",
+		headers,
+		body: JSON.stringify(payload)
+	});
+
+	const raw = await res.text();
+	let json = null;
+
 	try {
-		return await callGemini(apiKey, sessionId, userText);
+		json = JSON.parse(raw);
+	} catch (_) {}
+
+	if (!res.ok) {
+		const msg = json?.error?.message || raw.slice(0, 300);
+		throw new Error(`${getProviderLabel(config.provider)} hata: ${res.status} ${msg}`);
+	}
+
+	const reply = json?.choices?.[0]?.message?.content;
+
+	if (typeof reply !== "string" || reply.trim() === "") {
+		throw new Error(`${getProviderLabel(config.provider)} boş cevap döndü.`);
+	}
+
+	return reply.trim();
+}
+
+async function callAi(config, sessionId, userText) {
+	if (config.provider === "gemini") {
+		return callGemini(config, sessionId, userText);
+	}
+
+	return callOpenAiCompatible(config, sessionId, userText);
+}
+
+async function callAiWithRetry(config, sessionId, userText, retries = 2) {
+	try {
+		return await callAi(config, sessionId, userText);
 	} catch (err) {
 		const msg = String(err.message || err).toLowerCase();
 
 		const shouldRetry =
 			msg.includes("high demand") ||
 			msg.includes("currently experiencing high demand") ||
-			msg.includes("temporarily unavailable");
+			msg.includes("temporarily unavailable") ||
+			msg.includes("timeout") ||
+			msg.includes(" 500 ") ||
+			msg.includes(" 502 ") ||
+			msg.includes(" 503 ");
 
 		if (shouldRetry && retries > 0) {
 			await new Promise((resolve) => setTimeout(resolve, 1500));
-			return callGeminiWithRetry(apiKey, sessionId, userText, retries - 1);
+			return callAiWithRetry(config, sessionId, userText, retries - 1);
 		}
 
 		throw err;
@@ -573,19 +761,34 @@ app.post("/v1/check-key", async (req, res) => {
 			return res.status(401).json({ error: "unauthorized" });
 		}
 
-		const apiKey = String(req.body?.apiKey || "").trim();
+		const config = normalizeAiConfig({
+			provider: req.body?.provider,
+			apiKey: req.body?.apiKey,
+			model: req.body?.model
+		});
 
-		if (!apiKey) {
-			return res.status(400).json({ error: "apiKey gerekli" });
+		if (!config.provider) {
+			return res.status(400).json({ error: "Geçersiz provider. gemini, openai veya openrouter kullan." });
 		}
 
-		const health = await checkGeminiKeyHealth(apiKey);
+		const format = validateApiKeyFormat(config.apiKey);
+		if (!format.ok) {
+			return res.status(400).json({ error: format.error });
+		}
+
+		const health = await checkAiKeyHealth(config);
 
 		if (!health.ok) {
 			return res.status(health.status || 400).json(health);
 		}
 
-		return res.json(health);
+		return res.json({
+			ok: true,
+			provider: config.provider,
+			providerLabel: getProviderLabel(config.provider),
+			model: config.model,
+			message: health.message || "Key çalışıyor."
+		});
 	} catch (err) {
 		return res.status(500).json({
 			ok: false,
@@ -603,31 +806,33 @@ app.post("/v1/set-key", async (req, res) => {
 
 		const sessionId = getSessionId(req.body?.sessionId);
 		const playerName = sanitizeText(req.body?.playerName, 80);
-		const apiKey = String(req.body?.apiKey || "").trim();
+		const config = normalizeAiConfig({
+			provider: req.body?.provider,
+			apiKey: req.body?.apiKey,
+			model: req.body?.model
+		});
 
-		if (!apiKey) {
-			return res.status(400).json({ error: "apiKey gerekli" });
+		if (!config.provider) {
+			return res.status(400).json({ error: "Geçersiz provider. gemini, openai veya openrouter kullan." });
 		}
 
-		// Prefix kontrolü kaldırıldı: Gemini API key her zaman "AIza" ile başlamak zorunda değil.
-		// Gerçek doğrulama aşağıdaki Google/Gemini API çağrılarıyla yapılıyor.
-		if (apiKey.length < 16 || apiKey.length > 512 || /\s/.test(apiKey)) {
-			return res.status(400).json({ error: "API key formatı geçersiz." });
+		const format = validateApiKeyFormat(config.apiKey);
+		if (!format.ok) {
+			return res.status(400).json({ error: format.error });
 		}
 
-		const valid = await validateGeminiKey(apiKey);
-		if (!valid.ok) {
-			return res.status(400).json({ error: valid.error });
-		}
-
-		const health = await checkGeminiKeyHealth(apiKey);
+		const health = await checkAiKeyHealth(config);
 		if (!health.ok) {
 			return res.status(health.status || 400).json({
 				error: health.error || "Key health check başarısız."
 			});
 		}
 
-		const encryptedKey = encryptText(apiKey);
+		const encryptedKey = encryptText(JSON.stringify({
+			provider: config.provider,
+			apiKey: config.apiKey,
+			model: config.model
+		}));
 
 		await query(
 			`
@@ -651,7 +856,10 @@ app.post("/v1/set-key", async (req, res) => {
 		return res.json({
 			ok: true,
 			sessionId,
-			message: "API key başarıyla bağlandı."
+			provider: config.provider,
+			providerLabel: getProviderLabel(config.provider),
+			model: config.model,
+			message: `${getProviderLabel(config.provider)} key başarıyla bağlandı.`
 		});
 	} catch (err) {
 		return res.status(500).json({
@@ -716,13 +924,16 @@ app.get("/v1/key-status/:sessionId", async (req, res) => {
 		}
 
 		const sessionId = getSessionId(req.params.sessionId);
-		const result = await query(`SELECT 1 FROM user_keys WHERE session_id = $1`, [sessionId]);
 		const profile = await getProfile(sessionId);
+		const storedConfig = await getStoredAiConfig(sessionId);
 
 		return res.json({
 			ok: true,
 			sessionId,
-			hasKey: result.rows.length > 0,
+			hasKey: !!storedConfig?.apiKey,
+			provider: storedConfig?.provider || "gemini",
+			providerLabel: storedConfig ? getProviderLabel(storedConfig.provider) : "Gemini",
+			model: storedConfig?.model || DEFAULT_MODELS.gemini,
 			languagePreference: profile.language_preference || "Türkçe"
 		});
 	} catch (err) {
@@ -755,16 +966,16 @@ app.post("/v1/chat", async (req, res) => {
 			});
 		}
 
-		const apiKey = await getStoredApiKey(sessionId);
-		if (!apiKey) {
+		const aiConfig = await getStoredAiConfig(sessionId);
+		if (!aiConfig?.apiKey) {
 			return res.status(400).json({
-				error: "Önce kendi Gemini API key'ini bağlaman lazım."
+				error: "Önce kendi AI API key'ini bağlaman lazım."
 			});
 		}
 
 		await tryExtractProfile(sessionId, text);
 
-		const reply = await callGeminiWithRetry(apiKey, sessionId, text, 2);
+		const reply = await callAiWithRetry(aiConfig, sessionId, text, 2);
 
 		await addMessage(sessionId, "user", text);
 		await addMessage(sessionId, "model", reply);
