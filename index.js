@@ -135,10 +135,10 @@ async function checkGeminiKeyHealth(apiKey, model = DEFAULT_MODELS.gemini) {
 					parts: [{ text: "hello" }]
 				}
 			],
-			generationConfig: {
-				temperature: 0,
-				maxOutputTokens: 5
-			}
+		  	   generationConfig: {
+	       temperature: 0.7,
+	    maxOutputTokens: 700
+     }
 		})
 	});
 
@@ -578,8 +578,9 @@ function buildSystemPrompt(profile) {
 		"Sen Roblox içinde çalışan yardımsever bir AI asistansın.",
 		"Kullanıcı hangi dilde yazarsa o dilde cevap ver.",
 		"Kısa, doğal ve anlaşılır konuş.",
-		"Sohbet geçmişini dikkate al.",
-		"Kullanıcıyla ilgili kayıtlı bilgileri uygun olduğunda kullan."
+"Cevabı yarıda bırakma. Başladığın cümleyi mutlaka tamamla.",
+"Çok uzun anlatman gerekiyorsa 2-4 kısa cümleyle bitir.",
+"Sohbet geçmişini dikkate al.",
 	].join(" ");
 
 	return profileText ? `${systemText}\n\n${profileText}` : systemText;
