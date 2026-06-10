@@ -17,6 +17,12 @@ const DEFAULT_MODELS = {
 	openrouter: process.env.OPENROUTER_MODEL || "openrouter/free"
 };
 
+const MAX_AI_OUTPUT_TOKENS = Math.max(120, Math.min(Number(process.env.MAX_AI_OUTPUT_TOKENS || 700), 1400));
+const OPENROUTER_FALLBACK_MODELS = String(process.env.OPENROUTER_FALLBACK_MODELS || DEFAULT_MODELS.openrouter)
+	.split(",")
+	.map((item) => item.trim())
+	.filter(Boolean);
+
 const OPENAI_CHAT_URL = process.env.OPENAI_CHAT_URL || "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_CHAT_URL = process.env.OPENROUTER_CHAT_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://roblox.com";
@@ -135,10 +141,10 @@ async function checkGeminiKeyHealth(apiKey, model = DEFAULT_MODELS.gemini) {
 					parts: [{ text: "hello" }]
 				}
 			],
-		  	   generationConfig: {
-	       temperature: 0.7,
-	    maxOutputTokens: 700
-     }
+			generationConfig: {
+				temperature: 0,
+				maxOutputTokens: 5
+			}
 		})
 	});
 
@@ -575,12 +581,14 @@ async function getTopUsers(limit = 20) {
 function buildSystemPrompt(profile) {
 	const profileText = buildProfileText(profile);
 	const systemText = [
-		"Sen Roblox içinde çalışan yardımsever bir AI asistansın.",
-		"Kullanıcı hangi dilde yazarsa o dilde cevap ver.",
-		"Kısa, doğal ve anlaşılır konuş.",
-"Cevabı yarıda bırakma. Başladığın cümleyi mutlaka tamamla.",
-"Çok uzun anlatman gerekiyorsa 2-4 kısa cümleyle bitir.",
-"Sohbet geçmişini dikkate al.",
+		"Sen Roblox içinde çalışan yardımsever, premium hisli ama kısa konuşan bir AI asistansın.",
+		"Kullanıcı hangi dilde yazarsa sadece o dilde cevap ver.",
+		"Türkçe yazarsa Türkçe cevap ver; İngilizce düşünme notu, analiz, plan, scratchpad veya çeviri açıklaması gösterme.",
+		"Asla iç düşünce sürecini, chain-of-thought, 'Okay the user asked', 'Let me check', 'Looking back' gibi analiz cümlelerini yazma.",
+		"Cevabı yarıda bırakma. Başladığın cümleyi mutlaka tamamla.",
+		"Kısa, doğal ve anlaşılır konuş; gerekiyorsa 2-4 kısa cümleyle bitir.",
+		"Sohbet geçmişini dikkate al.",
+		"Kullanıcıyla ilgili kayıtlı bilgileri uygun olduğunda kullan."
 	].join(" ");
 
 	return profileText ? `${systemText}\n\n${profileText}` : systemText;
@@ -606,7 +614,7 @@ async function callGemini(config, sessionId, userText) {
 		],
 		generationConfig: {
 			temperature: 0.7,
-			maxOutputTokens: 180
+			maxOutputTokens: MAX_AI_OUTPUT_TOKENS
 		}
 	};
 
@@ -648,58 +656,173 @@ function historyToOpenAiMessages(history) {
 	})).filter((row) => row.content.trim() !== "");
 }
 
+function uniqueStrings(items) {
+	const seen = new Set();
+	const result = [];
+
+	for (const item of items) {
+		const value = String(item || "").trim();
+		if (!value || seen.has(value)) continue;
+		seen.add(value);
+		result.push(value);
+	}
+
+	return result;
+}
+
+function extractOpenAiReply(json) {
+	const message = json?.choices?.[0]?.message;
+	if (!message) return "";
+
+	const content = message.content;
+	if (typeof content === "string") return content.trim();
+
+	if (Array.isArray(content)) {
+		return content
+			.map((part) => {
+				if (typeof part === "string") return part;
+				if (typeof part?.text === "string") return part.text;
+				if (typeof part?.content === "string") return part.content;
+				return "";
+			})
+			.join(" ")
+			.trim();
+	}
+
+	return "";
+}
+
+function looksLikeInternalReasoning(text) {
+	const value = String(text || "").trim().toLowerCase();
+	if (!value) return false;
+
+	const badStarts = [
+		"okay, the user",
+		"okay the user",
+		"the user just asked",
+		"let me check",
+		"looking back",
+		"we need answer",
+		"we need to answer",
+		"i need to answer",
+		"i should answer",
+		"analysis:",
+		"reasoning:",
+		"thought process"
+	];
+
+	if (badStarts.some((prefix) => value.startsWith(prefix))) return true;
+
+	return (
+		value.includes("conversation history") &&
+		(value.includes("user asked") || value.includes("assistant has"))
+	);
+}
+
+function cleanupAiReply(text) {
+	let value = String(text || "").trim();
+
+	value = value.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+	value = value.replace(/^final\s*answer\s*:\s*/i, "").trim();
+	value = value.replace(/^cevap\s*:\s*/i, "").trim();
+
+	return value;
+}
+
+function buildProviderError(provider, status, msg) {
+	const label = getProviderLabel(provider);
+	const text = String(msg || "");
+	const lower = text.toLowerCase();
+
+	if (provider === "openai" && (status === 429 || lower.includes("quota") || lower.includes("insufficient_quota") || lower.includes("billing"))) {
+		return "OpenAI API hesabında kredi/billing veya usage limit aktif değil. Yeni key tek başına yetmez; platform hesabında billing/credit açılmalı.";
+	}
+
+	if (provider === "openrouter" && (status === 429 || lower.includes("rate limit"))) {
+		return "Free/OpenRouter günlük ücretsiz limitine takıldı veya router yoğun. Biraz sonra tekrar dene ya da OpenRouter'da credits ekle.";
+	}
+
+	return `${label} hata: ${status} ${text}`;
+}
+
 async function callOpenAiCompatible(config, sessionId, userText) {
 	const url = config.provider === "openrouter" ? OPENROUTER_CHAT_URL : OPENAI_CHAT_URL;
 	const history = await getSessionMessages(sessionId, 20);
 	const profile = await getProfile(sessionId);
 	const systemText = buildSystemPrompt(profile);
+	const modelList = config.provider === "openrouter"
+		? uniqueStrings([config.model, ...OPENROUTER_FALLBACK_MODELS])
+		: [config.model];
 
-	const headers = {
-		"Content-Type": "application/json",
-		"Authorization": `Bearer ${config.apiKey}`
-	};
+	let lastError = null;
+
+	for (const model of modelList) {
+		const attempts = config.provider === "openrouter" ? 3 : 1;
+
+		for (let attempt = 1; attempt <= attempts; attempt++) {
+			const headers = {
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${config.apiKey}`
+			};
+
+			if (config.provider === "openrouter") {
+				headers["HTTP-Referer"] = OPENROUTER_REFERER;
+				headers["X-Title"] = OPENROUTER_TITLE;
+			}
+
+			const payload = {
+				model,
+				messages: [
+					{ role: "system", content: systemText },
+					...historyToOpenAiMessages(history),
+					{ role: "user", content: sanitizeText(userText, 400) }
+				],
+				temperature: 0.55,
+				max_tokens: MAX_AI_OUTPUT_TOKENS
+			};
+
+			const res = await fetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(payload)
+			});
+
+			const raw = await res.text();
+			let json = null;
+
+			try {
+				json = JSON.parse(raw);
+			} catch (_) {}
+
+			if (!res.ok) {
+				const msg = json?.error?.message || raw.slice(0, 300);
+				throw new Error(buildProviderError(config.provider, res.status, msg));
+			}
+
+			let reply = cleanupAiReply(extractOpenAiReply(json));
+
+			if (!reply) {
+				const finishReason = json?.choices?.[0]?.finish_reason || "empty";
+				lastError = new Error(`${getProviderLabel(config.provider)} temiz cevap üretmedi. finish_reason=${finishReason}`);
+				await new Promise((resolve) => setTimeout(resolve, 650));
+				continue;
+			}
+
+			if (looksLikeInternalReasoning(reply)) {
+				lastError = new Error(`${getProviderLabel(config.provider)} iç analiz döndürdü; cevap engellendi.`);
+				await new Promise((resolve) => setTimeout(resolve, 650));
+				continue;
+			}
+
+			return reply;
+		}
+	}
 
 	if (config.provider === "openrouter") {
-		headers["HTTP-Referer"] = OPENROUTER_REFERER;
-		headers["X-Title"] = OPENROUTER_TITLE;
+		throw new Error("Free/OpenRouter şu an temiz cevap döndürmedi. Ücretsiz router bazen boş/analiz cevabı verebiliyor; tekrar dene veya Gemini/GPT kullan.");
 	}
 
-	const payload = {
-		model: config.model,
-		messages: [
-			{ role: "system", content: systemText },
-			...historyToOpenAiMessages(history),
-			{ role: "user", content: sanitizeText(userText, 400) }
-		],
-		temperature: 0.7,
-		max_tokens: 180
-	};
-
-	const res = await fetch(url, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(payload)
-	});
-
-	const raw = await res.text();
-	let json = null;
-
-	try {
-		json = JSON.parse(raw);
-	} catch (_) {}
-
-	if (!res.ok) {
-		const msg = json?.error?.message || raw.slice(0, 300);
-		throw new Error(`${getProviderLabel(config.provider)} hata: ${res.status} ${msg}`);
-	}
-
-	const reply = json?.choices?.[0]?.message?.content;
-
-	if (typeof reply !== "string" || reply.trim() === "") {
-		throw new Error(`${getProviderLabel(config.provider)} boş cevap döndü.`);
-	}
-
-	return reply.trim();
+	throw lastError || new Error(`${getProviderLabel(config.provider)} cevap üretemedi.`);
 }
 
 async function callAi(config, sessionId, userText) {
