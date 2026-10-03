@@ -4,12 +4,19 @@ if (!process.env.DATABASE_URL) {
 	throw new Error("DATABASE_URL eksik.");
 }
 
-const ssl = process.env.DATABASE_SSL_CA
-	? { rejectUnauthorized: true, ca: process.env.DATABASE_SSL_CA }
-	: { rejectUnauthorized: false };
+const ssl = {
+	rejectUnauthorized: true,
+	...(process.env.DATABASE_SSL_CA ? { ca: process.env.DATABASE_SSL_CA } : {})
+};
+
+// Prevent pg-connection-string from replacing these verified TLS options with
+// weaker sslmode/ssl values from DATABASE_URL.
+const databaseUrl = new URL(process.env.DATABASE_URL);
+databaseUrl.searchParams.delete("sslmode");
+databaseUrl.searchParams.delete("ssl");
 
 const pool = new Pool({
-	connectionString: process.env.DATABASE_URL,
+	connectionString: databaseUrl.toString(),
 	ssl,
 	max: 10,
 	idleTimeoutMillis: 30000,
